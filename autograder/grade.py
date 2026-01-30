@@ -4,11 +4,16 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import json
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Set
 
+from zoneinfo import ZoneInfo
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SUBMISSIONS_DIR = REPO_ROOT / "submissions"
+RESULTS_FILE = REPO_ROOT / "autograder" / "results.json"
 
 # Student IDs: PY102001001 .. PY102001020
 ID_PREFIX = "PY102001"
@@ -17,6 +22,23 @@ MAX_ID = 20
 
 # Allowed lab filenames
 ALLOWED_LABS = {"lab01.py", "lab02.py", "lab03.py"}
+
+TZ = ZoneInfo("America/Chicago")
+LAB_DEADLINES = {
+    "lab01.py": "2026-03-07 23:59",
+    "lab02.py": "2026-03-14 23:59",
+    "lab03.py": "2026-03-21 23:59",
+    "lab04.py": "2026-03-28 23:59",
+    "lab05.py": "2026-04-04 23:59",
+    "lab06.py": "2026-04-11 23:59",
+    "lab07.py": "2026-04-18 23:59",
+}
+
+# Late policy
+GRACE_DAYS = 2
+LATE_PENALTY_POINTS = 6      
+ZERO_AFTER_DAYS = 7
+LAB_MAX_POINTS = 20 
 
 
 def run(cmd: List[str]) -> str:
@@ -46,6 +68,78 @@ def get_changed_files(base_ref: str) -> List[str]:
     run(["git", "fetch", "origin", base_ref])
     diff = run(["git", "diff", "--name-only", f"origin/{base_ref}...HEAD"])
     return [line for line in diff.splitlines() if line.strip()]
+
+def parse_deadline(deadline_str: str) -> datetime:
+    # "YYYY-MM-DD HH:MM" in America/Chicago
+    return datetime.strptime(deadline_str, "%Y-%m-%d %H:%M").replace(tzinfo=TZ)
+
+def get_pr_updated_time() -> datetime | None:
+    """
+    GitHub Actions provides event payload JSON at GITHUB_EVENT_PATH.
+    For pull_request events, it contains pull_request.updated_at in ISO format.
+    """
+    event_path = os.environ.get("GITHUB_EVENT_PATH")
+    if not event_path or not Path(event_path).exists():
+        return None
+
+    data = json.loads(Path(event_path).read_text(encoding="utf-8"))
+    pr = data.get("pull_request")
+    if not pr:
+        return None
+
+    # Example: "2026-01-30T12:34:56Z"
+    updated_at = pr.get("updated_at") or pr.get("created_at")
+    if not updated_at:
+        return None
+
+    # Parse as UTC then convert to America/Chicago
+    t_utc = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+    return t_utc.astimezone(TZ)
+
+
+def days_late(submitted_at: datetime, deadline: datetime) -> int:
+    delta = submitted_at - deadline
+    if delta.total_seconds() <= 0:
+        return 0
+    return (delta.days + 1)
+
+def apply_late_policy(
+    *,
+    earned: int,
+    labs_touched: set[str],
+    submitted_at: datetime | None,
+) -> tuple[int, list[str]]:
+    messages: list[str] = []
+
+    if submitted_at is None:
+        return earned, ["⚠️ Could not read PR timestamp; no late penalty applied."]
+
+    deduction = 0
+
+    for lab in sorted(labs_touched):
+        deadline = parse_deadline(LAB_DEADLINES[lab])
+        dlate = days_late(submitted_at, deadline)
+
+        if dlate == 0:
+            messages.append(f"{lab}: on time")
+
+        elif dlate <= 7:
+            penalty = dlate  
+            deduction += penalty
+            messages.append(f"{lab}: {dlate} day(s) late → -{penalty}")
+
+        else:
+            deduction += LAB_MAX_POINTS
+            messages.append(f"{lab}: >7 days late → 0 for lab")
+
+    final_score = max(0, earned - deduction)
+
+    if deduction:
+        messages.append(f"⚠️ Total late deduction: -{deduction}")
+    else:
+        messages.append("✅ No late deduction applied")
+
+    return final_score, messages
 
 
 def main() -> None:
@@ -112,8 +206,14 @@ def main() -> None:
         print("Expected one of:", ", ".join(sorted(ALLOWED_LABS)))
         sys.exit(1)
 
-    print(f"Student: {student_id}")
-    print(f"Lab file(s) changed in PR: {', '.join(sorted(labs_touched))}")
+    missing_deadlines = [lab for lab in labs_touched if lab not in LAB_DEADLINES]
+    if missing_deadlines:
+        print("❌ Missing deadline config for:", ", ".join(missing_deadlines))
+        print("Edit LAB_DEADLINES in autograder/grade.py")
+        sys.exit(1)
+
+    print(f"✅ Student: {student_id}")
+    print(f"✅ Lab file(s) changed in PR: {', '.join(sorted(labs_touched))}")
 
     # 4) Export info for pytest (tests can use these)
     env = os.environ.copy()
@@ -122,10 +222,35 @@ def main() -> None:
     env["LABS_TOUCHED"] = ",".join(sorted(labs_touched))
 
     # 5) Run tests
-    # NOTE: You'll add pytest + pytest-timeout in autograder/requirements.txt
     cmd = ["pytest", "-q", "autograder/tests", "--timeout=5"]
     p = subprocess.run(cmd, cwd=REPO_ROOT, env=env, text=True)
     sys.exit(p.returncode)
+
+    if not RESULTS_FILE.exists():
+        print("❌ Could not find autograder/results.json (did conftest.py write it?)")
+        sys.exit(1)
+
+    results = json.loads(RESULTS_FILE.read_text(encoding="utf-8"))
+    earned = int(results.get("earned", 0))
+    max_points = int(results.get("max", 0))
+
+    submitted_at = get_pr_updated_time()
+
+    final_score, late_messages = apply_late_policy(
+        earned=earned,
+        max_points=max_points,
+        labs_touched=labs_touched,
+        submitted_at=submitted_at,
+    )
+
+    if submitted_at:
+        print(f"Submitted (PR updated): {submitted_at:%Y-%m-%d %H:%M %Z}")
+
+    for msg in late_messages:
+        print(" -", msg)
+
+    print(f"FINAL SCORE: {final_score}/{max_points}")
+    sys.exit(0)
 
 
 if __name__ == "__main__":
