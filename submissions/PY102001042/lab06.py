@@ -129,6 +129,7 @@ def personal_priority_q():
         (5, "friends"),
         (6, "money")
     ]
+    new_item = (2, "security")
     priorty_q.append(new_item)
     helper_fun1_(priorty_q, len(priorty_q) - 1)
 
